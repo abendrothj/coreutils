@@ -104,16 +104,8 @@ fn report_verbose_write_error(result: UResult<()>) {
 
 /// Helper function to show error with context and return error status
 fn show_removal_error(error: io::Error, path: &Path) -> bool {
-    if error.kind() == io::ErrorKind::PermissionDenied {
-        show_error!(
-            "{}",
-            translate!("rm-error-cannot-remove-permission-denied", "file" =>  path.quote())
-        );
-    } else {
-        let e =
-            error.map_err_context(|| translate!("rm-error-cannot-remove", "file" => path.quote()));
-        show_error!("{e}");
-    }
+    let e = error.map_err_context(|| translate!("rm-error-cannot-remove", "file" => path.quote()));
+    show_error!("{e}");
     true
 }
 
@@ -764,20 +756,27 @@ fn remove_dir_recursive(
     }
 }
 
-/// Check if a path resolves to the root directory.
+/// Check if a path is the root directory.
 /// Returns true if the path is root, false otherwise.
 fn is_root_path(path: &Path) -> bool {
-    // Check simple case: literal "/" path
+    // Check simple case: literal "/" path. Costs no syscall.
     if path.has_root() && path.parent().is_none() {
         return true;
     }
 
-    // Check if path resolves to "/" after following symlinks
-    if let Ok(canonical) = path.canonicalize() {
-        canonical.has_root() && canonical.parent().is_none()
-    } else {
-        false
+    // Otherwise settle by (st_dev, st_ino): a bind mount of "/" is a directory
+    // whose path never resolves to "/", so a name check misses it (symlinks too).
+    if uucore::fs::path_is_root_dir(path, true) {
+        return true;
     }
+
+    // Platforms without (st_dev, st_ino) keep the name-based test.
+    #[cfg(not(unix))]
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical.has_root() && canonical.parent().is_none();
+    }
+
+    false
 }
 
 /// Show error message for attempting to remove root.

@@ -16,7 +16,7 @@ use uucore::display::Quotable;
 use uucore::error::{
     ExitCode, UError, UResult, USimpleError, UUsageError, set_exit_code, strip_errno,
 };
-use uucore::fs::{FileInformation, display_permissions_unix};
+use uucore::fs::{FileInformation, display_permissions_unix, path_is_root_dir};
 use uucore::mode;
 use uucore::perms::{TraverseSymlinks, configure_symlink_and_recursion};
 
@@ -40,7 +40,7 @@ enum ChmodError {
     PreserveRootSameAs(PathBuf),
     #[error("{}", translate!("chmod-error-permission-denied", "file" => _0.quote()))]
     PermissionDenied(PathBuf),
-    #[error("{}", translate!("chmod-error-new-permissions", "file" => _0.maybe_quote(), "actual" => _1.clone(), "expected" => _2.clone()))]
+    #[error("{}", translate!("chmod-error-new-permissions", "file" => _0.maybe_quote(), "actual" => _1, "expected" => _2))]
     NewPermissions(PathBuf, String, String),
     #[error("{}", translate!("chmod-error-changing-permissions", "file" => _0.quote(), "err" => strip_errno(_1)))]
     ChangingPermissions(PathBuf, std::io::Error),
@@ -146,12 +146,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let verbose = matches.get_flag(options::VERBOSE);
     let preserve_root = matches.get_flag(options::PRESERVE_ROOT);
     let fmode = match matches.get_one::<OsString>(options::REFERENCE) {
-        Some(fref) => match fs::metadata(fref) {
-            Ok(meta) => Some(meta.mode() & 0o7777),
-            Err(_) => {
-                return Err(ChmodError::CannotStat(fref.into()).into());
-            }
-        },
+        Some(fref) => Some(
+            fs::metadata(fref)
+                .map(|meta| meta.mode() & 0o7777)
+                .map_err(|_| ChmodError::CannotStat(fref.into()))?,
+        ),
         None => None,
     };
 
@@ -517,7 +516,14 @@ impl Chmoder {
                 }
             }
             if self.recursive && self.preserve_root && Self::is_root(file) {
-                return Err(ChmodError::PreserveRoot("/".into()).into());
+                // Name the operand the user gave: with a bind mount of "/" it is
+                // not spelled "/", so say which path it is the same as.
+                return Err(if file.as_os_str() == "/" {
+                    ChmodError::PreserveRoot("/".into())
+                } else {
+                    ChmodError::PreserveRootSameAs(file.into())
+                }
+                .into());
             }
             if self.recursive {
                 let mut ancestors = HashSet::new();
@@ -531,19 +537,17 @@ impl Chmoder {
         r
     }
 
+    /// Whether `file` is `/`, by `(st_dev, st_ino)` rather than by name, so a
+    /// bind mount of `/` cannot slip past `--preserve-root` (as GNU does).
     fn is_root(file: impl AsRef<Path>) -> bool {
-        matches!(fs::canonicalize(&file), Ok(p) if p == Path::new("/"))
+        path_is_root_dir(file, true)
     }
 
-    /// `--preserve-root` guard for the recursive descent.
-    ///
-    /// The operand loop in [`Self::chmod`] only checks the paths named on the
-    /// command line. With `-L`, a symlink met *inside* the tree can resolve to
-    /// `/`, so the failsafe has to be re-checked at every descent or the
-    /// recursion walks straight into the real root. Only symlinks are
-    /// canonicalized, so ordinary trees pay nothing for this.
+    /// `--preserve-root` guard re-checked at every descent: a symlink to `/`
+    /// (under `-L`) or a bind mount of `/` met inside the tree is still `/`, so
+    /// the operand-only check is not enough. GNU re-checks every entry too.
     fn descends_into_root(&self, path: &Path) -> bool {
-        self.preserve_root && path.is_symlink() && Self::is_root(path)
+        self.preserve_root && Self::is_root(path)
     }
 
     // Non-safe traversal implementation for platforms without safe_traversal support
@@ -554,7 +558,8 @@ impl Chmoder {
         is_command_line_arg: bool,
         ancestors: &mut HashSet<FileInformation>,
     ) -> UResult<()> {
-        // Skip (and diagnose) a symlink that resolves to '/' before touching it.
+        // Skip (and diagnose) an entry that is '/' (a symlink to it, or a bind
+        // mount) before touching it.
         if self.descends_into_root(file_path) {
             show!(ChmodError::PreserveRootSameAs(file_path.into()));
             return Ok(());
@@ -631,7 +636,8 @@ impl Chmoder {
         is_command_line_arg: bool,
         ancestors: &mut HashSet<FileInformation>,
     ) -> UResult<()> {
-        // Skip (and diagnose) a symlink that resolves to '/' before touching it.
+        // Skip (and diagnose) an entry that is '/' (a symlink to it, or a bind
+        // mount) before touching it.
         if self.descends_into_root(file_path) {
             show!(ChmodError::PreserveRootSameAs(file_path.into()));
             return Ok(());
@@ -875,44 +881,34 @@ impl Chmoder {
         let (new_mode, naively_expected_new_mode) =
             self.calculate_new_mode(fperm, file.is_dir())?;
 
-        // Determine how to apply the permissions
-        if let Some(mode) = self.fmode {
-            // A symlink reached without dereferencing (for example one met while
-            // walking a `-R` tree) must be left alone: chmod(2) follows the link,
-            // so changing it would change the mode of the referent, which can live
-            // outside the tree. The symbolic/numeric path below already skips it.
-            if file.is_symlink() && !dereference {
-                if self.verbose {
-                    Self::print_neither_changed(file.into())?;
-                }
-            } else {
-                self.change_file(fperm, mode, file)?;
+        // A symlink reached without dereferencing (for example one met while
+        // walking a `-R` tree) must be left alone: chmod(2) follows the link,
+        // so changing it would change the mode of the referent, which can live
+        // outside the tree. On most Unix systems, symlink permissions are
+        // ignored by the kernel anyway, so changing them has no effect.
+        if file.is_symlink() && !dereference {
+            if self.verbose {
+                Self::print_neither_changed(file.into())?;
             }
         } else {
-            // Special handling for symlinks when not dereferencing
-            if file.is_symlink() && !dereference {
-                // TODO: On most Unix systems, symlink permissions are ignored by the kernel,
-                // so changing them has no effect. We skip this operation for compatibility.
-                // Note that "chmod without dereferencing" effectively does nothing on symlinks.
-                if self.verbose {
-                    Self::print_neither_changed(file.into())?;
-                }
-            } else {
-                self.change_file(fperm, new_mode, file)?;
-            }
-            // A bare mode such as `-w` is umask-relative, so the umask can keep permissions that
-            // the user asked to drop. GNU reports that as an error, but only when the mode was
-            // written in the option-like form (`chmod -w f`), where it doubles as a hint that the
-            // argument was consumed as a mode. After `--` the operand is unambiguous and GNU stays
-            // silent, so the diagnostic is suppressed here too.
-            if self.option_like_mode && (new_mode & !naively_expected_new_mode) != 0 {
-                return Err(ChmodError::NewPermissions(
-                    file.into(),
-                    display_permissions_unix(new_mode, false),
-                    display_permissions_unix(naively_expected_new_mode, false),
-                )
-                .into());
-            }
+            self.change_file(fperm, self.fmode.unwrap_or(new_mode), file)?;
+        }
+
+        // A bare mode such as `-w` is umask-relative, so the umask can keep permissions that
+        // the user asked to drop. GNU reports that as an error, but only when the mode was
+        // written in the option-like form (`chmod -w f`), where it doubles as a hint that the
+        // argument was consumed as a mode. After `--` the operand is unambiguous and GNU stays
+        // silent, so the diagnostic is suppressed here too.
+        if self.fmode.is_none()
+            && self.option_like_mode
+            && (new_mode & !naively_expected_new_mode) != 0
+        {
+            return Err(ChmodError::NewPermissions(
+                file.into(),
+                display_permissions_unix(new_mode, false),
+                display_permissions_unix(naively_expected_new_mode, false),
+            )
+            .into());
         }
 
         Ok(())
