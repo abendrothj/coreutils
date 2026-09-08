@@ -13,7 +13,7 @@ mod hardlink;
 #[cfg(target_os = "redox")]
 mod platform;
 #[cfg(target_os = "redox")]
-use platform::{copy_special_file, rename_special_fallback, replace_symlink};
+use platform::{copy_special_file, create_symlink_replace, rename_special_fallback};
 
 use clap::builder::ValueParser;
 use clap::error::ErrorKind;
@@ -1173,7 +1173,7 @@ fn rename_symlink_fallback(from: &Path, to: &Path) -> io::Result<()> {
     match unix::fs::symlink(&path_symlink_points_to, to) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            replace_symlink(&path_symlink_points_to, to)?;
+            create_symlink_replace(&path_symlink_points_to, to)?;
         }
         Err(e) => return Err(e),
     }
@@ -1214,7 +1214,7 @@ fn random_temp_name(urandom: &mut impl io::Read) -> io::Result<[u8; 8]> {
 /// from `/dev/urandom` so it is unguessable to other users in that
 /// directory.
 #[cfg(all(unix, not(target_os = "redox")))]
-fn replace_symlink(target: &Path, to: &Path) -> io::Result<()> {
+fn create_symlink_replace(target: &Path, to: &Path) -> io::Result<()> {
     use rustix::fs::{AtFlags, CWD, Mode, OFlags, openat, renameat, symlinkat, unlinkat};
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
